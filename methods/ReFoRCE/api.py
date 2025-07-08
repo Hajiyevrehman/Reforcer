@@ -2,11 +2,7 @@
 from __future__ import annotations
 import subprocess, json, shutil, tempfile, uuid, sqlite3, textwrap
 from pathlib import Path
-import pandas as pd
 
-# methods/ReFoRCE/api.py
-from pathlib import Path
-from pathlib import Path
 _RUN_PY = (Path(__file__).resolve().parent / "run.py").resolve()
 
 def _ensure_pandas():
@@ -17,79 +13,125 @@ def _ensure_pandas():
         import pandas  # noqa: F401
 
 def _ddl_from_sqlite(db: Path) -> str:
-    """Return CREATE-TABLE statements for *all* tables in the db."""
     con = sqlite3.connect(db)
-    cur = con.execute(
-        "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    ddl = "\n\n".join(                  
+        row[0] for row in                
+        con.execute("""
+            SELECT sql
+            FROM sqlite_master
+            WHERE type='table' AND name NOT LIKE 'sqlite_%'
+        """)
+        if row[0]                        
     )
-    ddls = [row[1] for row in cur.fetchall() if row[1]]
     con.close()
-    return "\n\n".join(ddls) or "-- (empty schema)"
+    return ddl or "-- (empty schema)"
 
+
+
+# ─── methods/ReFoRCE/api.py ─────────────────────────────────────────────
 def query_one(*,
-              sqlite_path: str | Path,
-              question: str,
-              model: str = "gpt-4o") -> dict:
+              sqlite_path : str | Path,
+              question    : str,
+              model       : str = "gpt-4o",
+              extra_schema: str | None = None,
+              num_workers : int = 1,
+              max_iter    : int = 5,
+              self_refine : bool = True,
+              show_log_tail: bool = False,
+              log_tail_lines: int = 40) -> dict:
     """
-    Run ReFoRCE once on a single question.
+    Run ReFoRCE on a single NL question.
+
+    Parameters
+    ----------
+    sqlite_path      : path to .sqlite
+    question         : natural-language question
+    model            : OpenAI model name (e.g. "gpt-4o")
+    extra_schema     : optional extra description appended to the CREATE statements
+    num_workers      : forwarded to run.py --num_workers
+    max_iter         : forwarded to run.py --max_iter
+    self_refine      : bool → add / drop --do_self_refinement
+    show_log_tail    : if True, print the last N lines of log.log
+    log_tail_lines   : how many lines to print
 
     Returns
     -------
-    dict with keys:
-      sql   → str      # model-generated SQL
-      answer→ pd.DataFrame
-      log   → Path     # full log file
-      workdir→ Path    # temp work directory (auto-deleted on exit unless you keep it)
+    dict {sql:str, answer:pandas.DataFrame, log:Path, workdir:Path}
     """
-    _ensure_pandas()
-    import pandas as pd                        # after install
+    import pandas as _pd, subprocess, tempfile, shutil, sqlite3, uuid, json, textwrap, os
+    from pathlib import Path
 
     sqlite_path = Path(sqlite_path).expanduser().resolve()
-    assert sqlite_path.exists(), f"DB not found: {sqlite_path}"
+    if not sqlite_path.exists():
+        raise FileNotFoundError(sqlite_path)
 
+    # temp work area ----------------------------------------------------
     workdir = Path(tempfile.mkdtemp(prefix="reforce_tmp_"))
     ex_id   = f"local-{uuid.uuid4().hex[:8]}"
     ex_dir  = workdir / ex_id
+    ex_dir.mkdir(parents=True)
 
+    # copy DB
     db_copy = ex_dir / "mydb.sqlite"
-    db_copy.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(sqlite_path, db_copy)
 
-    # generate prompts.txt from actual schema
-    ddl = _ddl_from_sqlite(db_copy)
+    # build prompts.txt -------------------------------------------------
+    def _ddl_from(db: Path) -> str:
+        con = sqlite3.connect(db)
+        ddl = "\n\n".join(row[0]
+                          for row in con.execute(
+                              "SELECT sql FROM sqlite_master "
+                              "WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+                          if row[0])
+        con.close()
+        return ddl or "-- (empty schema)"
+
+    ddl = _ddl_from(db_copy)
+    if extra_schema:
+        ddl += f"\n\n-- Extra notes\n{extra_schema.strip()}"
+
     (ex_dir / "prompts.txt").write_text(
-        textwrap.dedent(f"""\
-        The database contains the following tables:
+        textwrap.dedent(f"""
+        The database contains the following tables / columns:
 
         {ddl}
-        """)
+        """).lstrip()
     )
 
-    # minimal 1-line spider2-lite.jsonl
-    (workdir / "spider2-lite.jsonl").write_text(json.dumps({
-        "instance_id": ex_id,
-        "question":   question
-    }) + "\n")
+    # spider2-lite.jsonl -----------------------------------------------
+    (workdir / "spider2-lite.jsonl").write_text(
+        json.dumps({"instance_id": ex_id, "question": question}) + "\n"
+    )
 
-    # launch ReFoRCE
+    # launch run.py -----------------------------------------------------
     cmd = [
         "python", str(_RUN_PY),
-        "--task", "lite",
-        "--subtask", "sqlite",
+        "--task", "lite", "--subtask", "sqlite",
         "--db_path", str(workdir),
         "--output_path", str(workdir / "out"),
         "--generation_model", model,
-        "--do_self_refinement",
-        "--num_workers", "1"
+        "--num_workers", str(num_workers),
+        "--max_iter", str(max_iter),
     ]
+    if self_refine:
+        cmd.append("--do_self_refinement")
+
     subprocess.run(cmd, check=True)
 
-    # read back results
+    # collect output ----------------------------------------------------
     outdir  = workdir / "out" / ex_id
-    sql_txt = next(outdir.glob("*.sql")).read_text()
-    csv     = pd.read_csv(next(outdir.glob("*.csv")))
+    sql_files = list(outdir.glob("*.sql"))
+    if not sql_files:
+        raise RuntimeError(f"ReFoRCE produced no SQL; inspect {outdir/'log.log'}")
+
+    sql_txt = sql_files[0].read_text()
+    answer  = _pd.read_csv(next(outdir.glob("*.csv")))
+
+    if show_log_tail:
+        print(f"\n─ log tail ({log_tail_lines} lines) • {outdir/'log.log'} ─")
+        print("\n".join(outdir.joinpath("log.log").read_text().splitlines()[-log_tail_lines:]))
 
     return {"sql": sql_txt,
-            "answer": csv,
+            "answer": answer,
             "log": outdir / "log.log",
             "workdir": workdir}
